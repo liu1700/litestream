@@ -2460,6 +2460,7 @@ func (db *DB) checkpointWithExecutor(ctx context.Context, mode string, exec *syn
 	exec.applySyncResult(result)
 
 	var barrierTx *sql.Tx
+	var sealedInfo syncInfo
 	if mode == CheckpointModePassive {
 		barrierTx, err = db.db.BeginTx(ctx, nil)
 		if err != nil {
@@ -2480,6 +2481,18 @@ func (db *DB) checkpointWithExecutor(ctx context.Context, mode string, exec *syn
 			return false, fmt.Errorf("cannot seal wal before passive checkpoint: %w", err)
 		}
 		exec.applySyncResult(result)
+
+		// The barrier transaction now owns the writer lock, so no commit can
+		// land between this position and our checkpoint. Capture the LTX commit
+		// while the proof is still held; the post-checkpoint sync can continue
+		// from the new WAL without using generic reset detection.
+		sealedInfo, err = db.verifyWithExecutor(ctx, exec)
+		if err != nil {
+			return false, fmt.Errorf("verify sealed wal before passive checkpoint: %w", err)
+		}
+		if sealedInfo.snapshotting {
+			return false, fmt.Errorf("sealed wal requires snapshot before passive checkpoint: %s", sealedInfo.reason)
+		}
 	}
 
 	frameSize := int64(db.pageSize + WALFrameHeaderSize)
@@ -2527,9 +2540,14 @@ func (db *DB) checkpointWithExecutor(ctx context.Context, mode string, exec *syn
 	exec.state.truncatePassiveFailed = false
 
 	if mode == CheckpointModePassive {
-		result, err = db.verifyAndSyncWithExecutor(ctx, true, exec, 0)
+		sealedInfo.offset = WALHeaderSize
+		sealedInfo.salt1 = binary.BigEndian.Uint32(other[16:])
+		sealedInfo.salt2 = binary.BigEndian.Uint32(other[20:])
+		sealedInfo.snapshotting = false
+		sealedInfo.reason = "sealed passive checkpoint"
+		result, err = db.sync(ctx, true, exec, sealedInfo, 0)
 		if err != nil {
-			return false, fmt.Errorf("cannot copy wal after passive checkpoint: %w", err)
+			return false, fmt.Errorf("cannot copy sealed wal after passive checkpoint: %w", err)
 		}
 		exec.applySyncResult(result)
 		exec.state.syncedSinceCheckpoint = false
