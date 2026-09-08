@@ -2152,12 +2152,13 @@ func TestDB_CheckpointDoesNotTriggerSnapshot(t *testing.T) {
 func testCheckpointSnapshot(t *testing.T, mode string) {
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "db")
+	replicaDir := t.TempDir()
 
 	db := NewDB(dbPath)
 	db.MonitorInterval = 0    // Disable background monitor
 	db.CheckpointInterval = 0 // Disable time-based checkpoints
 	db.Replica = NewReplica(db)
-	db.Replica.Client = &testReplicaClient{dir: t.TempDir()}
+	db.Replica.Client = &testReplicaClient{dir: replicaDir}
 	db.Replica.MonitorEnabled = false
 	if err := db.Open(); err != nil {
 		t.Fatal(err)
@@ -2223,6 +2224,62 @@ func testCheckpointSnapshot(t *testing.T, mode string) {
 	t.Logf("Checkpoint mode=%s completed", mode)
 	posAfterChk, _ := db.Pos()
 	t.Logf("After checkpoint: TXID=%d", posAfterChk.TXID)
+	if mode == CheckpointModePassive {
+		if err := db.Replica.Sync(ctx); err != nil {
+			t.Fatal(err)
+		}
+		path := db.LTXPath(0, posAfterChk.TXID, posAfterChk.TXID)
+		f, err := os.Open(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		dec := ltx.NewDecoder(f)
+		if err := dec.DecodeHeader(); err != nil {
+			f.Close()
+			t.Fatal(err)
+		}
+		hdr := dec.Header()
+		pageN := 0
+		buf := make([]byte, hdr.PageSize)
+		for {
+			var phdr ltx.PageHeader
+			err := dec.DecodePage(&phdr, buf)
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				f.Close()
+				t.Fatal(err)
+			}
+			pageN++
+		}
+		if err := f.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if uint32(pageN) >= hdr.Commit {
+			t.Fatalf("PASSIVE checkpoint emitted full-page LTX: pages=%d commit=%d", pageN, hdr.Commit)
+		}
+
+		restorePath := filepath.Join(t.TempDir(), "restored.db")
+		restoreDB := NewDB(restorePath)
+		restoreDB.Replica = NewReplica(restoreDB)
+		restoreDB.Replica.Client = &testReplicaClient{dir: replicaDir}
+		if err := restoreDB.Replica.Restore(ctx, RestoreOptions{OutputPath: restorePath, IntegrityCheck: IntegrityCheckFull}); err != nil {
+			t.Fatalf("restore PASSIVE checkpoint chain: %v", err)
+		}
+		restored, err := sql.Open("sqlite", restorePath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer restored.Close()
+		var rowN int
+		if err := restored.QueryRow(`SELECT count(*) FROM t`).Scan(&rowN); err != nil {
+			t.Fatal(err)
+		}
+		if rowN != 101 {
+			t.Fatalf("restored row count=%d, want 101", rowN)
+		}
+	}
 
 	// Make a small change to create some WAL data
 	if _, err := sqldb.Exec(`INSERT INTO t VALUES (10000, 'after checkpoint')`); err != nil {
