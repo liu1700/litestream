@@ -3548,6 +3548,189 @@ func TestDB_CheckpointPageGapWithConcurrentWrites(t *testing.T) {
 	}
 }
 
+// TestDB_SyncExternalWALResetTakesBoundarySnapshot covers a checkpoint that
+// occurs while Litestream's read lock is unavailable. A previous LTX reaching
+// the end of the WAL does not prove that later writes were replicated before
+// this external checkpoint resets the WAL.
+func TestDB_SyncExternalWALResetTakesBoundarySnapshot(t *testing.T) {
+	tests := []struct {
+		name    string
+		mode    string
+		retains bool
+	}{
+		{name: "Truncate", mode: "TRUNCATE"},
+		{name: "Restart", mode: "RESTART", retains: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			dbPath := filepath.Join(dir, "db")
+			replicaDir := t.TempDir()
+			ctx := context.Background()
+
+			db := NewDB(dbPath)
+			db.MonitorInterval = 0
+			db.CheckpointInterval = 0
+			db.Replica = NewReplica(db)
+			db.Replica.Client = &testReplicaClient{dir: replicaDir}
+			db.Replica.MonitorEnabled = false
+			if err := db.Open(); err != nil {
+				t.Fatal(err)
+			}
+			defer func() {
+				if err := db.Close(ctx); err != nil {
+					t.Fatal(err)
+				}
+			}()
+
+			sqldb, err := sql.Open("sqlite", dbPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer sqldb.Close()
+			sqldb.SetMaxOpenConns(1)
+			if _, err := sqldb.Exec(`PRAGMA journal_mode = wal`); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := sqldb.Exec(`CREATE TABLE t (id INTEGER PRIMARY KEY, data BLOB)`); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := sqldb.Exec(`CREATE TABLE heartbeat (id INTEGER PRIMARY KEY)`); err != nil {
+				t.Fatal(err)
+			}
+			if err := db.Sync(ctx); err != nil {
+				t.Fatal(err)
+			}
+
+			// This state is fully represented by the preceding LTX and records that
+			// it reached the then-current WAL end.
+			for i := 0; i < 80; i++ {
+				if _, err := sqldb.Exec(`INSERT INTO t VALUES (?, zeroblob(3500))`, i); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := db.Sync(ctx); err != nil {
+				t.Fatal(err)
+			}
+			beforeReset, err := os.Stat(db.WALPath())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if beforeReset.Size() <= WALHeaderSize {
+				t.Fatalf("WAL size before external reset=%d", beforeReset.Size())
+			}
+
+			if err := db.releaseReadLock(); err != nil {
+				t.Fatal(err)
+			}
+			readLockReleased := true
+			defer func() {
+				if readLockReleased {
+					if err := db.acquireReadLock(ctx); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}()
+
+			// These writes change existing B-tree pages after the last LTX. The
+			// external checkpoint moves them into the database and restarts the WAL.
+			for i := 80; i < 201; i++ {
+				if _, err := sqldb.Exec(`INSERT INTO t VALUES (?, zeroblob(3500))`, i); err != nil {
+					t.Fatal(err)
+				}
+			}
+			var busy, logN, checkpointed int
+			if err := sqldb.QueryRow(`PRAGMA wal_checkpoint(`+tt.mode+`)`).Scan(&busy, &logN, &checkpointed); err != nil {
+				t.Fatal(err)
+			}
+			if busy != 0 {
+				t.Fatalf("external %s checkpoint=%d,%d,%d", tt.mode, busy, logN, checkpointed)
+			}
+			afterReset, err := os.Stat(db.WALPath())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tt.retains {
+				if afterReset.Size() < beforeReset.Size() {
+					t.Fatalf("WAL size after external restart=%d, want retained size >=%d", afterReset.Size(), beforeReset.Size())
+				}
+			} else if afterReset.Size() > WALHeaderSize {
+				t.Fatalf("WAL size after external truncate=%d, want <=%d", afterReset.Size(), WALHeaderSize)
+			}
+			// Keep the post-reset WAL nonempty without rewriting t's stale B-tree
+			// pages. The old incremental reset path then loses rows from t.
+			if _, err := sqldb.Exec(`INSERT INTO heartbeat VALUES (1)`); err != nil {
+				t.Fatal(err)
+			}
+			if err := db.acquireReadLock(ctx); err != nil {
+				t.Fatal(err)
+			}
+			readLockReleased = false
+
+			if err := db.Sync(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if err := db.Replica.Sync(ctx); err != nil {
+				t.Fatal(err)
+			}
+			pos, err := db.Pos()
+			if err != nil {
+				t.Fatal(err)
+			}
+			ltxPath := db.LTXPath(0, pos.TXID, pos.TXID)
+			f, err := os.Open(ltxPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			dec := ltx.NewDecoder(f)
+			if err := dec.DecodeHeader(); err != nil {
+				f.Close()
+				t.Fatal(err)
+			}
+			hdr := dec.Header()
+			pageN := 0
+			buf := make([]byte, hdr.PageSize)
+			for {
+				var phdr ltx.PageHeader
+				err := dec.DecodePage(&phdr, buf)
+				if err == io.EOF {
+					break
+				}
+				if err != nil {
+					f.Close()
+					t.Fatal(err)
+				}
+				pageN++
+			}
+			if err := f.Close(); err != nil {
+				t.Fatal(err)
+			}
+			restorePath := filepath.Join(t.TempDir(), "restored.db")
+			restoreDB := NewDB(restorePath)
+			restoreDB.Replica = NewReplica(restoreDB)
+			restoreDB.Replica.Client = &testReplicaClient{dir: replicaDir}
+			if err := restoreDB.Replica.Restore(ctx, RestoreOptions{OutputPath: restorePath, IntegrityCheck: IntegrityCheckFull}); err != nil {
+				t.Fatalf("restore after external WAL reset: %v", err)
+			}
+			restored, err := sql.Open("sqlite", restorePath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer restored.Close()
+			var rowN int
+			if err := restored.QueryRow(`SELECT count(*) FROM t`).Scan(&rowN); err != nil {
+				t.Fatal(err)
+			}
+			if rowN != 201 {
+				t.Fatalf("restored row count=%d, want 201", rowN)
+			}
+			if uint32(pageN) != hdr.Commit {
+				t.Fatalf("reset LTX coverage=%d pages, commit=%d; want boundary snapshot", pageN, hdr.Commit)
+			}
+		})
+	}
+}
+
 // TestDB_Sync_InitErrorMetrics verifies that sync error counter is incremented
 // when db.init() fails. Regression test for issue #1128.
 func TestDB_Sync_InitErrorMetrics(t *testing.T) {

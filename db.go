@@ -1707,37 +1707,17 @@ func (db *DB) verifyWithExecutor(ctx context.Context, exec *syncExecutor) (info 
 	info.salt2 = dec.Header().WALSalt2
 	info.prevCommit = dec.Header().Commit
 
-	// If LTX WAL offset is larger than real WAL then the WAL has been truncated.
+	// If the LTX WAL offset is larger than the real WAL then the WAL has been
+	// reset after the last LTX. A previous sync reaching the end of its WAL is
+	// not proof that no commits landed before an external checkpoint: those
+	// commits may have been checkpointed into the main database and truncated
+	// before this sync observes them. Start a full snapshot so every main-db
+	// page at the reset boundary is represented in the new LTX.
 	if fi, err := os.Stat(db.WALPath()); err != nil {
 		return info, fmt.Errorf("open wal file: %w", err)
 	} else if info.offset > fi.Size() {
 		exec.state.truncatePassiveFailed = false
-
-		// If we previously synced to the exact end of the WAL, this truncation
-		// is expected (normal checkpoint behavior). Reset position and continue
-		// incrementally rather than triggering a full snapshot. See issue #927.
-		if exec.state.syncedToWALEnd {
-			// Read new WAL header to get current salt values
-			hdr, err := readWALHeader(db.WALPath())
-			if err != nil {
-				return info, fmt.Errorf("read wal header after expected truncation: %w", err)
-			}
-
-			info.offset = WALHeaderSize
-			info.salt1 = binary.BigEndian.Uint32(hdr[16:])
-			info.salt2 = binary.BigEndian.Uint32(hdr[20:])
-			info.snapshotting = false
-			info.reason = ""
-			info.clearSyncedToWALEnd = true
-
-			db.Logger.Log(ctx, internal.LevelTrace, "wal truncated after sync to end (expected checkpoint)",
-				"new_salt1", info.salt1,
-				"new_salt2", info.salt2)
-
-			return info, nil
-		}
-
-		info.reason = "wal truncated by another process"
+		info.reason = "wal reset after last ltx"
 		return info, nil
 	}
 
@@ -1795,24 +1775,15 @@ func (db *DB) verifyWithExecutor(ctx context.Context, exec *syncExecutor) (info 
 
 	db.Logger.Debug("verify.2", "lastPageMatch", lastPageMatch)
 
-	// Salt has changed which could indicate a FULL checkpoint.
-	// If we have a last page match, then we can assume that the WAL has not been overwritten.
+	// A changed WAL salt proves that the previous WAL generation is no longer
+	// current. A matching old frame or a known-salt scan cannot prove that all
+	// commits between the last LTX and this reset were captured: they may have
+	// been checkpointed into the main database before the reset. Snapshot the
+	// boundary so those main-db pages are represented in the next LTX.
 	if !saltMatch {
-		db.Logger.Log(ctx, internal.LevelTrace, "wal restarted",
-			"salt1", salt1,
-			"salt2", salt2)
-
 		info.offset = WALHeaderSize
 		info.salt1, info.salt2 = salt1, salt2
-
-		if detected, err := db.detectFullCheckpoint(ctx, [][2]uint32{{salt1, salt2}, {dec.Header().WALSalt1, dec.Header().WALSalt2}}); err != nil {
-			return info, fmt.Errorf("detect full checkpoint: %w", err)
-		} else if detected {
-			info.reason = "full or restart checkpoint detected, snapshotting"
-		} else {
-			info.snapshotting = false
-		}
-
+		info.reason = "wal salt reset after last ltx"
 		return info, nil
 	}
 
