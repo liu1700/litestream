@@ -4029,7 +4029,7 @@ func TestVerifyAndSync_DelaysStateMutationUntilApply(t *testing.T) {
 	}
 }
 
-func TestVerifyAndSync_DelaysExpectedTruncationStateMutationUntilApply(t *testing.T) {
+func TestVerifyAndSync_DelaysResetSnapshotStateMutationUntilApply(t *testing.T) {
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "db")
 
@@ -4075,8 +4075,22 @@ func TestVerifyAndSync_DelaysExpectedTruncationStateMutationUntilApply(t *testin
 		t.Fatal("syncedToWALEnd=false, want true after sync")
 	}
 	oldSyncedToWALEnd := db.syncState.syncedToWALEnd
+	oldWALOffset := db.syncState.lastSyncedWALOffset
 
-	if err := os.Truncate(db.WALPath(), WALHeaderSize); err != nil {
+	if err := db.releaseReadLock(); err != nil {
+		t.Fatal(err)
+	}
+	var busy, logN, checkpointed int
+	if err := sqldb.QueryRow(`PRAGMA wal_checkpoint(TRUNCATE)`).Scan(&busy, &logN, &checkpointed); err != nil {
+		t.Fatal(err)
+	}
+	if busy != 0 {
+		t.Fatalf("external checkpoint=%d,%d,%d", busy, logN, checkpointed)
+	}
+	if _, err := sqldb.Exec(`INSERT INTO t VALUES (2, 'after')`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.acquireReadLock(ctx); err != nil {
 		t.Fatal(err)
 	}
 
@@ -4084,11 +4098,14 @@ func TestVerifyAndSync_DelaysExpectedTruncationStateMutationUntilApply(t *testin
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result.synced {
-		t.Fatal("verifyAndSync reported a sync, want no sync after truncation without new writes")
+	if !result.synced {
+		t.Fatal("verifyAndSync did not snapshot the external reset")
 	}
-	if result.syncedToWALEnd {
-		t.Fatal("result.syncedToWALEnd=true, want false")
+	if result.newWALSize == oldWALOffset {
+		t.Fatal("fixture did not change the synced WAL offset")
+	}
+	if db.syncState.lastSyncedWALOffset != oldWALOffset {
+		t.Fatalf("WAL offset mutated before apply: got %d, want %d", db.syncState.lastSyncedWALOffset, oldWALOffset)
 	}
 	if db.syncState.syncedToWALEnd != oldSyncedToWALEnd {
 		t.Fatalf("syncedToWALEnd mutated early: got %t, want %t", db.syncState.syncedToWALEnd, oldSyncedToWALEnd)
@@ -4096,8 +4113,11 @@ func TestVerifyAndSync_DelaysExpectedTruncationStateMutationUntilApply(t *testin
 
 	db.applySyncResult(&db.syncState, result)
 
-	if db.syncState.syncedToWALEnd {
-		t.Fatal("syncedToWALEnd=true after apply, want false")
+	if db.syncState.syncedToWALEnd != result.syncedToWALEnd {
+		t.Fatalf("syncedToWALEnd=%t after apply, want %t", db.syncState.syncedToWALEnd, result.syncedToWALEnd)
+	}
+	if db.syncState.lastSyncedWALOffset != result.newWALSize {
+		t.Fatalf("WAL offset=%d after apply, want %d", db.syncState.lastSyncedWALOffset, result.newWALSize)
 	}
 }
 
