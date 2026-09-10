@@ -418,17 +418,43 @@ func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ctx := s.ctx
+	// A control client can time out while its sync waits for the executor. Keep
+	// the daemon shutdown signal, but also stop work that no caller awaits.
+	startedAt := time.Now()
+	ctx, cancelRequest := context.WithCancel(r.Context())
+	stopServerCancel := context.AfterFunc(s.ctx, cancelRequest)
+	var cancelTimeout context.CancelFunc
 	if req.Wait && req.Timeout == 0 {
 		req.Timeout = 30
 	}
 	if req.Timeout > 0 {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(s.ctx, time.Duration(req.Timeout)*time.Second)
-		defer cancel()
+		ctx, cancelTimeout = context.WithTimeout(ctx, time.Duration(req.Timeout)*time.Second)
 	}
 
+	var cancellationLogged sync.Once
+	logCancellation := func() {
+		cancellationLogged.Do(func() {
+			s.logSyncRequestProblem("control sync request canceled", expandedPath, req.Wait, startedAt, context.Cause(ctx))
+		})
+	}
+	stopCancellationLog := context.AfterFunc(ctx, logCancellation)
+	defer func() {
+		// Stop the cancellation callback before cleaning up successful requests.
+		stopCancellationLog()
+		if cancelTimeout != nil {
+			cancelTimeout()
+		}
+		stopServerCancel()
+		cancelRequest()
+	}()
+
 	result, err := s.store.SyncDB(ctx, expandedPath, req.Wait)
+	stopCancellationLog()
+	if ctx.Err() != nil {
+		logCancellation()
+	} else if err != nil {
+		s.logSyncRequestProblem("control sync request failed", expandedPath, req.Wait, startedAt, err)
+	}
 	if err != nil {
 		switch {
 		case errors.Is(err, ErrDatabaseNotFound):
@@ -456,6 +482,21 @@ func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 		TXID:           result.TXID,
 		ReplicatedTXID: result.ReplicatedTXID,
 	})
+}
+
+// logSyncRequestProblem records the DB state observed when a control request
+// ends abnormally. The observed state can belong to another concurrent sync.
+func (s *Server) logSyncRequestProblem(message, path string, wait bool, startedAt time.Time, cause error) {
+	attrs := []any{
+		"path", path,
+		"wait", wait,
+		"elapsed_seconds", time.Since(startedAt).Seconds(),
+		"cause", cause,
+	}
+	if db := s.store.FindDB(path); db != nil {
+		attrs = append(attrs, "observed_db_sync", db.SyncDiagnostic())
+	}
+	s.logger.Warn(message, attrs...)
 }
 
 // SyncRequest is the request body for the /sync endpoint.
