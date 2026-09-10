@@ -7,8 +7,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -24,6 +26,48 @@ type blockedLTXStagingFile struct {
 	started chan<- struct{}
 	release <-chan struct{}
 	once    sync.Once
+}
+
+type syncLogRecord struct {
+	Level          string          `json:"level"`
+	Message        string          `json:"msg"`
+	Path           string          `json:"path"`
+	Wait           bool            `json:"wait"`
+	ElapsedSeconds float64         `json:"elapsed_seconds"`
+	Cause          string          `json:"cause"`
+	ObservedDBSync json.RawMessage `json:"observed_db_sync"`
+}
+
+func waitForSyncLog(t *testing.T, logs *lockedLogBuffer, message string) syncLogRecord {
+	t.Helper()
+	deadline := time.After(time.Second)
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+	for {
+		for _, line := range strings.Split(strings.TrimSpace(logs.String()), "\n") {
+			if line == "" {
+				continue
+			}
+			var record syncLogRecord
+			if err := json.Unmarshal([]byte(line), &record); err != nil {
+				t.Fatalf("decode log record: %v: %s", err, line)
+			}
+			if record.Message == message {
+				return record
+			}
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("log %q not found: %s", message, logs.String())
+		case <-ticker.C:
+		}
+	}
+}
+
+func newSyncLogBuffer(server *Server) *lockedLogBuffer {
+	logs := &lockedLogBuffer{}
+	server.logger = slog.New(slog.NewJSONHandler(logs, nil))
+	return logs
 }
 
 func (f *blockedLTXStagingFile) Sync() error {
@@ -52,6 +96,7 @@ func TestServer_HandleSync_ClientCancellationCancelsQueuedSync(t *testing.T) {
 	defer store.Close(t.Context())
 
 	server := NewServer(store)
+	logs := newSyncLogBuffer(server)
 	server.SocketPath = filepath.Join(t.TempDir(), "litestream.sock")
 	if err := server.Start(); err != nil {
 		t.Fatal(err)
@@ -99,7 +144,29 @@ func TestServer_HandleSync_ClientCancellationCancelsQueuedSync(t *testing.T) {
 	if err := <-result; err == nil || !errors.Is(err, context.Canceled) {
 		t.Fatalf("client error = %v, want context canceled", err)
 	}
-
+	logRecord := waitForSyncLog(t, logs, "control sync request canceled")
+	if logRecord.Level != "WARN" {
+		t.Errorf("log level = %q, want WARN", logRecord.Level)
+	}
+	if logRecord.Path != db.Path() {
+		t.Errorf("log path = %q, want %q", logRecord.Path, db.Path())
+	}
+	if logRecord.Wait {
+		t.Error("log wait = true, want false")
+	}
+	if logRecord.ElapsedSeconds <= 0 {
+		t.Errorf("log elapsed_seconds = %v, want positive", logRecord.ElapsedSeconds)
+	}
+	if logRecord.Cause != context.Canceled.Error() {
+		t.Errorf("log cause = %q, want %q", logRecord.Cause, context.Canceled)
+	}
+	var observed SyncDiagnostic
+	if err := json.Unmarshal(logRecord.ObservedDBSync, &observed); err != nil {
+		t.Fatalf("decode observed DB sync: %v", err)
+	}
+	if observed.Path != db.Path() {
+		t.Errorf("observed DB path = %q, want %q", observed.Path, db.Path())
+	}
 	deadline = time.After(time.Second)
 	for db.SyncDiagnostic().ExecutorWaiterCount != 0 {
 		select {
@@ -107,6 +174,165 @@ func TestServer_HandleSync_ClientCancellationCancelsQueuedSync(t *testing.T) {
 			t.Fatal("canceled client left /sync queued on DB executor")
 		case <-ticker.C:
 		}
+	}
+	if got := strings.Count(logs.String(), `"msg":"control sync request canceled"`); got != 1 {
+		t.Errorf("cancellation logs = %d, want 1: %s", got, logs.String())
+	}
+	if strings.Contains(logs.String(), `"msg":"control sync request failed"`) {
+		t.Errorf("canceled request also logged a failure: %s", logs.String())
+	}
+}
+
+func TestServer_HandleSync_PreCanceledRequestLogsCancellation(t *testing.T) {
+	db := NewDB(filepath.Join(t.TempDir(), "db"))
+	store := NewStore([]*DB{db}, CompactionLevels{{Level: 0}})
+	server := NewServer(store)
+	logs := newSyncLogBuffer(server)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	req := httptest.NewRequest(http.MethodPost, "/sync", strings.NewReader(fmt.Sprintf(`{"path":%q}`, db.Path()))).WithContext(ctx)
+	resp := httptest.NewRecorder()
+	server.handleSync(resp, req)
+
+	if resp.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want %d", resp.Code, http.StatusConflict)
+	}
+	logRecord := waitForSyncLog(t, logs, "control sync request canceled")
+	if logRecord.Path != db.Path() {
+		t.Errorf("log path = %q, want %q", logRecord.Path, db.Path())
+	}
+	if logRecord.Cause != context.Canceled.Error() {
+		t.Errorf("log cause = %q, want %q", logRecord.Cause, context.Canceled)
+	}
+	if got := strings.Count(logs.String(), `"msg":"control sync request canceled"`); got != 1 {
+		t.Errorf("cancellation logs = %d, want 1: %s", got, logs.String())
+	}
+}
+
+func TestServer_HandleSync_CancellationLogsObservedActiveSync(t *testing.T) {
+	db := NewDB(filepath.Join(t.TempDir(), "db"))
+	db.MonitorInterval = 0
+	db.ShutdownSyncTimeout = 0
+	db.Replica = NewReplicaWithClient(db, &testReplicaClient{dir: t.TempDir()})
+	db.Replica.MonitorEnabled = false
+	if err := db.Open(); err != nil {
+		t.Fatal(err)
+	}
+
+	sqldb, err := sql.Open("sqlite", db.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqldb.Close()
+	if _, err := sqldb.Exec(`PRAGMA journal_mode = wal; CREATE TABLE t (id INTEGER PRIMARY KEY); INSERT INTO t DEFAULT VALUES;`); err != nil {
+		t.Fatal(err)
+	}
+
+	store := NewStore([]*DB{db}, CompactionLevels{{Level: 0}})
+	store.CompactionMonitorEnabled = false
+	if err := store.Open(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close(t.Context())
+	server := NewServer(store)
+	logs := newSyncLogBuffer(server)
+	server.SocketPath = filepath.Join(t.TempDir(), "litestream.sock")
+	if err := server.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+
+	started, release := make(chan struct{}), make(chan struct{})
+	var releaseOnce sync.Once
+	defer releaseOnce.Do(func() { close(release) })
+	db.openLTXFile = func(name string, flag int, perm os.FileMode) (ltxStagingFile, error) {
+		file, err := os.OpenFile(name, flag, perm)
+		if err != nil {
+			return nil, err
+		}
+		return &blockedLTXStagingFile{File: file, started: started, release: release}, nil
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	result := doRequest(socketClient(server.SocketPath), syncRequest(t, ctx, db.Path()))
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("sync did not reach blocked LTX fsync")
+	}
+
+	cancel()
+	if response := <-result; response.err == nil || !errors.Is(response.err, context.Canceled) {
+		t.Fatalf("client error = %v, want context canceled", response.err)
+	}
+	logRecord := waitForSyncLog(t, logs, "control sync request canceled")
+	var observed SyncDiagnostic
+	if err := json.Unmarshal(logRecord.ObservedDBSync, &observed); err != nil {
+		t.Fatalf("decode observed DB sync: %v", err)
+	}
+	if !observed.Active || observed.Operation != "sync" || observed.Phase != "fsync_ltx" {
+		t.Errorf("observed sync = active=%t operation=%q phase=%q, want active sync/fsync_ltx", observed.Active, observed.Operation, observed.Phase)
+	}
+	releaseOnce.Do(func() { close(release) })
+}
+
+func TestServer_HandleSync_LogsNonContextFailure(t *testing.T) {
+	db := NewDB(filepath.Join(t.TempDir(), "db"))
+	store := NewStore([]*DB{db}, CompactionLevels{{Level: 0}})
+	server := NewServer(store)
+	logs := newSyncLogBuffer(server)
+
+	req := httptest.NewRequest(http.MethodPost, "/sync", strings.NewReader(fmt.Sprintf(`{"path":%q,"wait":true}`, db.Path())))
+	resp := httptest.NewRecorder()
+	server.handleSync(resp, req)
+
+	if resp.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want %d", resp.Code, http.StatusConflict)
+	}
+	logRecord := waitForSyncLog(t, logs, "control sync request failed")
+	if logRecord.Path != db.Path() || !logRecord.Wait {
+		t.Errorf("log path/wait = %q/%t, want %q/true", logRecord.Path, logRecord.Wait, db.Path())
+	}
+	if logRecord.ElapsedSeconds <= 0 {
+		t.Errorf("log elapsed_seconds = %v, want positive", logRecord.ElapsedSeconds)
+	}
+	if logRecord.Cause == "" {
+		t.Error("log cause is empty")
+	}
+	if len(logRecord.ObservedDBSync) == 0 {
+		t.Error("log observed_db_sync is absent")
+	}
+}
+
+func TestServer_HandleSync_SuccessDoesNotLogWarning(t *testing.T) {
+	db := NewDB(filepath.Join(t.TempDir(), "db"))
+	db.MonitorInterval = 0
+	db.ShutdownSyncTimeout = 0
+	db.Replica = NewReplicaWithClient(db, &testReplicaClient{dir: t.TempDir()})
+	db.Replica.MonitorEnabled = false
+	if err := db.Open(); err != nil {
+		t.Fatal(err)
+	}
+	store := NewStore([]*DB{db}, CompactionLevels{{Level: 0}})
+	store.CompactionMonitorEnabled = false
+	if err := store.Open(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close(t.Context())
+
+	server := NewServer(store)
+	logs := newSyncLogBuffer(server)
+	req := httptest.NewRequest(http.MethodPost, "/sync", strings.NewReader(fmt.Sprintf(`{"path":%q}`, db.Path())))
+	resp := httptest.NewRecorder()
+	server.handleSync(resp, req)
+
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d: %s", resp.Code, http.StatusOK, resp.Body.String())
+	}
+	if got := strings.TrimSpace(logs.String()); got != "" {
+		t.Errorf("successful sync emitted logs: %s", got)
 	}
 }
 
