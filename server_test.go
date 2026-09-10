@@ -657,6 +657,49 @@ func TestServer_HandleSync(t *testing.T) {
 	})
 }
 
+func TestHTTPServer_RequestContextCancelsOnUnixClientCancellation(t *testing.T) {
+	socketPath := testSocketPath(t)
+	listener, err := net.Listen("unix", socketPath)
+	require.NoError(t, err)
+	defer listener.Close()
+
+	requestStarted := make(chan struct{})
+	requestCanceled := make(chan struct{})
+	httpServer := &http.Server{Handler: http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		close(requestStarted)
+		<-r.Context().Done()
+		close(requestCanceled)
+	})}
+	defer httpServer.Close()
+	go httpServer.Serve(listener)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://localhost/test", nil)
+	require.NoError(t, err)
+	result := make(chan error, 1)
+	go func() {
+		resp, err := newSocketClient(t, socketPath).Do(req)
+		if resp != nil {
+			resp.Body.Close()
+		}
+		result <- err
+	}()
+
+	select {
+	case <-requestStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("handler did not start")
+	}
+	cancel()
+	require.ErrorIs(t, <-result, context.Canceled)
+	select {
+	case <-requestCanceled:
+	case <-time.After(time.Second):
+		t.Fatal("handler request context stayed live after client cancellation")
+	}
+}
+
 func TestServer_HandleSyncStatus(t *testing.T) {
 	t.Run("AllDatabases", func(t *testing.T) {
 		db, sqldb := testingutil.MustOpenDBs(t)
