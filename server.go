@@ -418,13 +418,18 @@ func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ctx := s.ctx
+	// A control client can time out while its sync waits for the executor. Keep
+	// the daemon shutdown signal, but also stop work that no caller awaits.
+	ctx, cancelRequest := context.WithCancel(r.Context())
+	defer cancelRequest()
+	stopServerCancel := context.AfterFunc(s.ctx, cancelRequest)
+	defer stopServerCancel()
 	if req.Wait && req.Timeout == 0 {
 		req.Timeout = 30
 	}
 	if req.Timeout > 0 {
 		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(s.ctx, time.Duration(req.Timeout)*time.Second)
+		ctx, cancel = context.WithTimeout(ctx, time.Duration(req.Timeout)*time.Second)
 		defer cancel()
 	}
 
