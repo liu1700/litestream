@@ -452,11 +452,10 @@ func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 	stopCancellationLog()
 	if ctx.Err() != nil {
 		logCancellation()
+	} else if err != nil {
+		s.logSyncRequestProblem("control sync request failed", expandedPath, req.Wait, startedAt, err)
 	}
 	if err != nil {
-		if ctx.Err() == nil {
-			s.logSyncRequestProblem("control sync request failed", expandedPath, req.Wait, startedAt, err)
-		}
 		switch {
 		case errors.Is(err, ErrDatabaseNotFound):
 			writeJSONError(w, http.StatusNotFound, err.Error(), nil)
