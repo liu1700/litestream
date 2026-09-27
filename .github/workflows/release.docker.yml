@@ -13,6 +13,8 @@ on:
 name: Release (Docker)
 jobs:
   docker:
+    # Plori releases are built by plori-release.yml.
+    if: github.repository == 'benbjohnson/litestream'
     runs-on: ubuntu-latest
     env:
       # CGO cross-compilation supported platforms

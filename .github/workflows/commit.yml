@@ -368,7 +368,8 @@ jobs:
     name: Run S3 Integration Tests
     runs-on: ubuntu-latest
     needs: build
-    if: github.ref == 'refs/heads/main'
+    # These provider credentials belong to the upstream repository.
+    if: github.repository == 'benbjohnson/litestream' && github.ref == 'refs/heads/main'
     concurrency:
       group: integration-test-s3
     steps:
@@ -393,7 +394,8 @@ jobs:
     name: Run GCP Integration Tests
     runs-on: ubuntu-latest
     needs: build
-    if: github.ref == 'refs/heads/main'
+    # These provider credentials belong to the upstream repository.
+    if: github.repository == 'benbjohnson/litestream' && github.ref == 'refs/heads/main'
     concurrency:
       group: integration-test-gcp
     steps:
@@ -422,7 +424,8 @@ jobs:
     name: Run Azure Blob Store Integration Tests
     runs-on: ubuntu-latest
     needs: build
-    if: github.ref == 'refs/heads/main'
+    # These provider credentials belong to the upstream repository.
+    if: github.repository == 'benbjohnson/litestream' && github.ref == 'refs/heads/main'
     concurrency:
       group: integration-test-abs
     steps:
@@ -446,7 +449,8 @@ jobs:
     name: Run Cloudflare R2 Integration Tests
     runs-on: ubuntu-latest
     needs: build
-    if: github.ref == 'refs/heads/main'
+    # These provider credentials belong to the upstream repository.
+    if: github.repository == 'benbjohnson/litestream' && github.ref == 'refs/heads/main'
     concurrency:
       group: integration-test-r2
     steps:

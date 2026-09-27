@@ -18,6 +18,8 @@ permissions:
 
 jobs:
   goreleaser:
+    # Plori releases are built by plori-release.yml.
+    if: github.repository == 'benbjohnson/litestream'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout

@@ -17,14 +17,9 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
 	"github.com/benbjohnson/litestream"
-	"github.com/benbjohnson/litestream/abs"
 	"github.com/benbjohnson/litestream/file"
-	"github.com/benbjohnson/litestream/gs"
 	"github.com/benbjohnson/litestream/internal"
-	"github.com/benbjohnson/litestream/nats"
-	"github.com/benbjohnson/litestream/oss"
 	"github.com/benbjohnson/litestream/s3"
-	"github.com/benbjohnson/litestream/sftp"
 )
 
 // ReplicateCommand represents a command that continuously replicates SQLite databases.
@@ -333,16 +328,6 @@ func (c *ReplicateCommand) Run(ctx context.Context) (err error) {
 			slogWith.Info("replicating to", "path", client.Path())
 		case *s3.ReplicaClient:
 			slogWith.Info("replicating to", "bucket", client.Bucket, "path", client.Path, "region", client.Region, "endpoint", client.Endpoint)
-		case *gs.ReplicaClient:
-			slogWith.Info("replicating to", "bucket", client.Bucket, "path", client.Path)
-		case *abs.ReplicaClient:
-			slogWith.Info("replicating to", "bucket", client.Bucket, "path", client.Path, "endpoint", client.Endpoint)
-		case *sftp.ReplicaClient:
-			slogWith.Info("replicating to", "host", client.Host, "user", client.User, "path", client.Path)
-		case *nats.ReplicaClient:
-			slogWith.Info("replicating to", "bucket", client.BucketName, "url", client.URL)
-		case *oss.ReplicaClient:
-			slogWith.Info("replicating to", "bucket", client.Bucket, "path", client.Path, "region", client.Region)
 		default:
 			slogWith.Info("replicating to")
 		}
