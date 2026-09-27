@@ -11,7 +11,6 @@ import (
 	"os/user"
 	"path/filepath"
 	"runtime"
-	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -19,10 +18,7 @@ import (
 	"github.com/benbjohnson/litestream"
 	main "github.com/benbjohnson/litestream/cmd/litestream"
 	"github.com/benbjohnson/litestream/file"
-	"github.com/benbjohnson/litestream/gs"
-	"github.com/benbjohnson/litestream/nats"
 	"github.com/benbjohnson/litestream/s3"
-	"github.com/benbjohnson/litestream/sftp"
 )
 
 func TestMain_RunHelp(t *testing.T) {
@@ -413,100 +409,6 @@ func TestNewS3ReplicaFromConfig(t *testing.T) {
 	})
 }
 
-func TestNewGSReplicaFromConfig(t *testing.T) {
-	r, err := main.NewReplicaFromConfig(&main.ReplicaConfig{URL: "gs://foo/bar"}, nil)
-	if err != nil {
-		t.Fatal(err)
-	} else if client, ok := r.Client.(*gs.ReplicaClient); !ok {
-		t.Fatal("unexpected replica type")
-	} else if got, want := client.Bucket, "foo"; got != want {
-		t.Fatalf("Bucket=%s, want %s", got, want)
-	} else if got, want := client.Path, "bar"; got != want {
-		t.Fatalf("Path=%s, want %s", got, want)
-	}
-}
-
-func TestNewNATSReplicaFromConfig_TLS(t *testing.T) {
-	config, err := main.ParseConfig(strings.NewReader(`
-dbs:
-  - path: /tmp/db
-    replica:
-      type: nats
-      bucket: bucket
-      tls: true
-      root-cas: [ca.pem]
-      client-cert: client.pem
-      client-key: client-key.pem
-`), false)
-	if err != nil {
-		t.Fatal(err)
-	}
-	r, err := main.NewReplicaFromConfig(config.DBs[0].Replica, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	client, ok := r.Client.(*nats.ReplicaClient)
-	if !ok {
-		t.Fatal("unexpected replica type")
-	}
-	if !client.TLS {
-		t.Fatal("TLS=false, want true")
-	}
-	if got, want := client.RootCAs, []string{"ca.pem"}; !slices.Equal(got, want) {
-		t.Fatalf("RootCAs=%v, want %v", got, want)
-	}
-	if got, want := client.ClientCert, "client.pem"; got != want {
-		t.Fatalf("ClientCert=%q, want %q", got, want)
-	}
-	if got, want := client.ClientKey, "client-key.pem"; got != want {
-		t.Fatalf("ClientKey=%q, want %q", got, want)
-	}
-}
-
-func TestNewNATSReplicaFromConfig_TLSOverridesGlobalDefault(t *testing.T) {
-	config, err := main.ParseConfig(strings.NewReader(`
-tls: true
-dbs:
-  - path: /tmp/db
-    replica:
-      type: nats
-      bucket: bucket
-      tls: false
-  - path: /tmp/db-inherits
-    replica:
-      type: nats
-      bucket: bucket
-`), false)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	tests := []struct {
-		name  string
-		index int
-		want  bool
-	}{
-		{name: "ExplicitFalse", index: 0, want: false},
-		{name: "InheritedTrue", index: 1, want: true},
-	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			r, err := main.NewReplicaFromConfig(config.DBs[test.index].Replica, nil)
-			if err != nil {
-				t.Fatal(err)
-			}
-			client, ok := r.Client.(*nats.ReplicaClient)
-			if !ok {
-				t.Fatal("unexpected replica type")
-			}
-			if client.TLS != test.want {
-				t.Fatalf("TLS=%v, want %v", client.TLS, test.want)
-			}
-		})
-	}
-}
-
 func TestNewS3ReplicaFromConfig_SignAcceptEncodingInheritance(t *testing.T) {
 	config, err := main.ParseConfig(strings.NewReader(`
 sign-accept-encoding: false
@@ -548,26 +450,19 @@ dbs:
 	}
 }
 
-func TestNewSFTPReplicaFromConfig(t *testing.T) {
-	hostKey := "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAnK0+GdwOelXlAXdqLx/qvS7WHMr3rH7zW2+0DtmK5r"
-	r, err := main.NewReplicaFromConfig(&main.ReplicaConfig{
-		URL: "sftp://user@example.com:2222/foo",
-		ReplicaSettings: main.ReplicaSettings{
-			HostKey: hostKey,
-		},
-	}, nil)
-	if err != nil {
-		t.Fatal(err)
-	} else if client, ok := r.Client.(*sftp.ReplicaClient); !ok {
-		t.Fatal("unexpected replica type")
-	} else if got, want := client.HostKey, hostKey; got != want {
-		t.Fatalf("HostKey=%s, want %s", got, want)
-	} else if got, want := client.Host, "example.com:2222"; got != want {
-		t.Fatalf("Host=%s, want %s", got, want)
-	} else if got, want := client.User, "user"; got != want {
-		t.Fatalf("User=%s, want %s", got, want)
-	} else if got, want := client.Path, "/foo"; got != want {
-		t.Fatalf("Path=%s, want %s", got, want)
+func TestNewReplicaFromConfig_UnsupportedBackends(t *testing.T) {
+	for _, backend := range []string{"abs", "gs", "sftp", "nats", "webdav", "oss"} {
+		t.Run(backend, func(t *testing.T) {
+			for _, config := range []*main.ReplicaConfig{
+				{Type: backend, Path: "backup"},
+				{URL: backend + "://bucket/backup"},
+			} {
+				_, err := main.NewReplicaFromConfig(config, nil)
+				if err == nil || !strings.Contains(err.Error(), "unknown replica type in config") {
+					t.Fatalf("unsupported backend %q: got %v, want unknown replica type", backend, err)
+				}
+			}
+		})
 	}
 }
 
@@ -3754,11 +3649,6 @@ secret-access-key: GLOBAL_S3_SECRET
 region: global-region
 endpoint: global.endpoint.com
 storage-class: GLACIER_IR
-account-name: global-abs-account
-account-key: global-abs-key
-host: global.sftp.host
-user: global-sftp-user
-password: global-sftp-pass
 sync-interval: 45s
 
 dbs:
@@ -3767,14 +3657,9 @@ dbs:
       type: s3
       bucket: s3-bucket
 
-  - path: /tmp/abs.sqlite
+  - path: /tmp/file.sqlite
     replica:
-      type: abs
-      bucket: abs-container
-
-  - path: /tmp/sftp.sqlite
-    replica:
-      type: sftp
+      type: file
       path: /backup/path
 `[1:]), 0666); err != nil {
 			t.Fatal(err)
@@ -3808,31 +3693,10 @@ dbs:
 			t.Errorf("s3Replica.SyncInterval=%v, want %v", s3Replica.SyncInterval, expectedSyncInterval)
 		}
 
-		// Test ABS replica inherits ABS-specific defaults
-		absReplica := config.DBs[1].Replica
-		if got, want := absReplica.AccountName, "global-abs-account"; got != want {
-			t.Errorf("absReplica.AccountName=%v, want %v", got, want)
-		}
-		if got, want := absReplica.AccountKey, "global-abs-key"; got != want {
-			t.Errorf("absReplica.AccountKey=%v, want %v", got, want)
-		}
-		if absReplica.SyncInterval == nil || *absReplica.SyncInterval != expectedSyncInterval {
-			t.Errorf("absReplica.SyncInterval=%v, want %v", absReplica.SyncInterval, expectedSyncInterval)
-		}
-
-		// Test SFTP replica inherits SFTP-specific defaults
-		sftpReplica := config.DBs[2].Replica
-		if got, want := sftpReplica.Host, "global.sftp.host"; got != want {
-			t.Errorf("sftpReplica.Host=%v, want %v", got, want)
-		}
-		if got, want := sftpReplica.User, "global-sftp-user"; got != want {
-			t.Errorf("sftpReplica.User=%v, want %v", got, want)
-		}
-		if got, want := sftpReplica.Password, "global-sftp-pass"; got != want {
-			t.Errorf("sftpReplica.Password=%v, want %v", got, want)
-		}
-		if sftpReplica.SyncInterval == nil || *sftpReplica.SyncInterval != expectedSyncInterval {
-			t.Errorf("sftpReplica.SyncInterval=%v, want %v", sftpReplica.SyncInterval, expectedSyncInterval)
+		// File replicas share timing defaults with S3 replicas.
+		fileReplica := config.DBs[1].Replica
+		if fileReplica.SyncInterval == nil || *fileReplica.SyncInterval != expectedSyncInterval {
+			t.Errorf("fileReplica.SyncInterval=%v, want %v", fileReplica.SyncInterval, expectedSyncInterval)
 		}
 	})
 }

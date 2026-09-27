@@ -1,0 +1,70 @@
+name: Plori CI and release
+
+on:
+  push:
+    branches: ['**']
+    tags: ['v*-plori.*']
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Build
+        run: go build -o "$RUNNER_TEMP/bin/" ./...
+      - name: Vet
+        run: go vet ./...
+      # The default suite skips destination tests behind -integration because
+      # cloud credentials and SFTP/NATS servers are unavailable. Local backend
+      # tests still run. VFS and soak tests require their explicit build tags.
+      - name: Test with race detector
+        run: go test -race -v ./...
+
+  build-release:
+    if: github.repository == 'plori-ai/litestream' && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && contains(github.ref_name, '-plori.')
+    needs: check
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Build Linux archives and checksums
+        run: bash scripts/plori-release.sh "$GITHUB_REF_NAME" "$RUNNER_TEMP/plori-release"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: plori-release
+          path: ${{ runner.temp }}/plori-release/*
+          if-no-files-found: error
+
+  publish:
+    needs: build-release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: plori-release
+          path: ${{ runner.temp }}/plori-release
+      - name: Publish release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          cd "$RUNNER_TEMP/plori-release"
+          sha256sum --check checksums.txt
+          gh release create "$GITHUB_REF_NAME" \
+            --verify-tag --title "$GITHUB_REF_NAME" \
+            --notes "Linux amd64 and arm64 binaries built by GitHub Actions. Each archive includes build-info.txt with the commit and Go version." \
+            ./*.tar.gz checksums.txt
